@@ -20,7 +20,7 @@ from pipeline.diag_report import (
 from pipeline.diag_segments import DiagSegment
 
 DEVELOPER = "Alim Unagasov"
-APP_NAME = "Анализ капельного теста масла"
+APP_NAME = "Oil Blotter Analyzer"
 MAX_IMAGE_SIDE = 1800
 APP_VERSION = "1.2"
 
@@ -96,7 +96,7 @@ class WebcamDialog:
 class OilDropAnalyzerApp:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
-        self.root.title("Анализ капельного теста масла")
+        self.root.title(APP_NAME)
         self.root.geometry("1280x820")
         self.root.minsize(1100, 700)
 
@@ -586,7 +586,7 @@ class OilDropAnalyzerApp:
 
 
 def main() -> None:
-    print(f"Анализ капельного теста масла — разработчик: {DEVELOPER}")
+    print(f"{APP_NAME} — разработчик: {DEVELOPER}")
     root = tk.Tk()
     style = ttk.Style()
     if "vista" in style.theme_names():

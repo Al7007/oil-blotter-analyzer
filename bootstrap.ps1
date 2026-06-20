@@ -1,4 +1,4 @@
-# Автоустановка Python и зависимостей для «Анализ капельного теста масла»
+# Oil Blotter Analyzer — автоустановка Python и зависимостей
 # Запуск: двойной щелчок по run.bat или Запуск.bat
 
 $ErrorActionPreference = "Stop"
@@ -221,7 +221,7 @@ function Start-Application([string]$PythonExe) {
 try {
     Write-Host ""
     Write-Host "========================================" -ForegroundColor White
-    Write-Host "  Анализ капельного теста масла" -ForegroundColor White
+    Write-Host "  Oil Blotter Analyzer" -ForegroundColor White
     Write-Host "  Подготовка окружения..." -ForegroundColor White
     Write-Host "========================================" -ForegroundColor White
 
