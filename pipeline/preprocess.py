@@ -967,13 +967,12 @@ def find_drop_candidates_full_image(rgb: np.ndarray) -> tuple[list[DropCandidate
         cx, cy = candidate.geometry.center
         add_at(cx * inv_scale, cy * inv_scale)
 
-    if not raw:
-        x0, y0, x1, y1 = _paper_bounds(paper_mask)
-        paper_short = min(x1 - x0 + 1, y1 - y0 + 1)
-        min_distance = max(24, int(paper_short * 0.09 / max(scale, 1e-6)))
-        peaks = _find_stain_peak_positions(stain, paper_mask, min_distance=min_distance)
-        for cx, cy in peaks:
-            add_at(cx * inv_scale, cy * inv_scale)
+    x0, y0, x1, y1 = _paper_bounds(paper_mask)
+    paper_short = min(x1 - x0 + 1, y1 - y0 + 1)
+    min_distance = max(24, int(paper_short * 0.09 / max(scale, 1e-6)))
+    peaks = _find_stain_peak_positions(stain, paper_mask, min_distance=min_distance)
+    for cx, cy in peaks:
+        add_at(cx * inv_scale, cy * inv_scale)
 
     if not raw:
         work = stain_full.copy()
