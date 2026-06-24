@@ -207,22 +207,30 @@ def _estimate_fuel_pct(zones: BlotterZones, t_thickness_norm: float) -> float:
     """
     Полевая оценка % топлива по зоне T (ASTM blotter spot).
 
-    Опора: узкая прозрачная кромка (~10–12% радиуса) — норма;
-    расширение зоны T коррелирует с разбавлением дизельным топливом
-    (Machinery Lubrication, Practical Sailor). Не заменяет GC/FTIR.
+    R_wick нормализует край хроматограммы; базовая кромка ~11% радиуса — норма.
+    Не заменяет ASTM D7593 (GC).
     """
     baseline_thickness = 0.11
     baseline_area = 1.0 - (1.0 - baseline_thickness) ** 2
 
     excess_thickness = max(0.0, t_thickness_norm - baseline_thickness)
-    from_thickness = excess_thickness / 0.16 * 10.0
+    from_thickness = excess_thickness / 0.18 * 8.0
 
     drop_area = max(np.count_nonzero(zones.drop), 1)
     t_area_frac = np.count_nonzero(zones.T) / drop_area
     excess_area = max(0.0, t_area_frac - baseline_area)
-    from_area = excess_area / 0.18 * 8.0
+    from_area = excess_area / 0.20 * 7.0
 
-    estimate = 0.55 * from_thickness + 0.45 * from_area
+    profile = zones.radial_profile
+    retain = 0.0
+    if profile.size >= 16:
+        outer = float(np.mean(profile[int(0.76 * profile.size) : int(0.96 * profile.size)]))
+        body = float(np.mean(profile[int(0.42 * profile.size) : int(0.72 * profile.size)]))
+        if body > 1e-6:
+            retain = max(0.0, (outer / body - 0.38) / 0.42)
+
+    from_retain = retain * 6.5
+    estimate = 0.50 * from_thickness + 0.35 * from_area + 0.15 * from_retain
     return float(np.clip(estimate, 0.0, 20.0))
 
 

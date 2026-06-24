@@ -163,34 +163,132 @@ def compute_stain_map(rgb: np.ndarray, paper_mask: np.ndarray) -> np.ndarray:
 
 
 def find_drop_geometry(stain: np.ndarray, mask: np.ndarray) -> DropGeometry | None:
-    if not np.any(mask):
+    """Геометрия капли по окраске внутри маски (не по геометрии UI-круга)."""
+    paper_mask = np.ones(stain.shape, dtype=bool)
+    return find_chromatogram_geometry(stain, paper_mask, search_mask=mask > 0)
+
+
+def _radial_mean_profile(
+    stain: np.ndarray,
+    mask: np.ndarray,
+    center: tuple[float, float],
+    max_radius: float,
+    bins: int = 80,
+) -> np.ndarray:
+    h, w = stain.shape
+    cx, cy = center
+    ys, xs = np.indices((h, w))
+    dist = np.sqrt((xs - cx) ** 2 + (ys - cy) ** 2)
+    norm_r = np.clip(dist / max(max_radius, 1.0), 0, 1)
+    valid = mask > 0
+    profile = np.zeros(bins, dtype=np.float32)
+    counts = np.zeros(bins, dtype=np.int32)
+    bin_idx = np.clip((norm_r[valid] * (bins - 1)).astype(np.int32), 0, bins - 1)
+    np.add.at(profile, bin_idx, stain[valid])
+    np.add.at(counts, bin_idx, 1)
+    counts = np.maximum(counts, 1)
+    profile /= counts
+    return cv2.GaussianBlur(profile.reshape(1, -1), (1, 7), 0).flatten()
+
+
+def _wick_radius_from_profile(profile: np.ndarray, peak_stain: float) -> float:
+    """Нормированный радиус края хроматограммы (0..1) по спаду окраски."""
+    if profile.size < 8 or peak_stain <= 0:
+        return 0.42
+
+    threshold = max(peak_stain * 0.085, 0.035)
+    last_high = 0
+    for index in range(profile.size - 1, 0, -1):
+        if profile[index] >= threshold:
+            last_high = index
+            break
+
+    if last_high == 0:
+        for index in range(profile.size):
+            if profile[index] >= threshold * 1.5:
+                last_high = max(last_high, index)
+
+    return float(np.clip((last_high + 1) / profile.size, 0.14, 0.58))
+
+
+def find_chromatogram_geometry(
+    stain: np.ndarray,
+    paper_mask: np.ndarray,
+    *,
+    hint_center: tuple[float, float] | None = None,
+    search_mask: np.ndarray | None = None,
+) -> DropGeometry | None:
+    """
+    Граница капли по фактической окраске на бумаге (R_wick), не по UI-маске.
+
+    hint_center — подсказка (клик / пик); search_mask — только для выбора капли (ROI).
+    """
+    work = stain.copy()
+    work[~paper_mask] = 0.0
+    peak = float(work.max())
+    if peak < 0.06:
         return None
 
-    mask_bool = mask > 0
-    weights = stain * mask_bool
-    if float(np.sum(weights)) > 0:
-        ys, xs = np.indices(stain.shape)
-        total = float(np.sum(weights))
-        cx = float(np.sum(xs * weights) / total)
-        cy = float(np.sum(ys * weights) / total)
-    else:
-        moments = cv2.moments(mask.astype(np.uint8))
-        if moments["m00"] <= 0:
+    if search_mask is not None:
+        roi = work.copy()
+        roi[~search_mask.astype(bool)] = 0.0
+        roi_peak = float(roi.max())
+        if roi_peak < peak * 0.04:
             return None
-        cx = moments["m10"] / moments["m00"]
-        cy = moments["m01"] / moments["m00"]
+        weights = roi * (roi >= max(roi_peak * 0.08, 0.04))
+        ys, xs = np.indices(stain.shape)
+        total = float(weights.sum())
+        if total > 0:
+            cx = float((xs * weights).sum() / total)
+            cy = float((ys * weights).sum() / total)
+        elif hint_center is not None:
+            cx, cy = float(hint_center[0]), float(hint_center[1])
+        else:
+            return None
+    elif hint_center is not None:
+        cx = float(hint_center[0])
+        cy = float(hint_center[1])
+    else:
+        stained = paper_mask & (work >= max(peak * 0.065, 0.045))
+        if not np.any(stained):
+            stained = paper_mask & (work >= peak * 0.04)
+        if not np.any(stained):
+            return None
+        weights = work * stained.astype(np.float32)
+        ys, xs = np.indices(stain.shape)
+        total = float(weights.sum())
+        if total <= 0:
+            cy, cx = np.unravel_index(int(np.argmax(work)), work.shape)
+            cx, cy = float(cx), float(cy)
+        else:
+            cx = float((xs * weights).sum() / total)
+            cy = float((ys * weights).sum() / total)
 
-    ys, xs = np.where(mask_bool)
-    distances = np.sqrt((xs - cx) ** 2 + (ys - cy) ** 2)
-    radius = float(np.percentile(distances, 90))
-    if radius < 8:
+    stained = paper_mask & (work >= max(peak * 0.055, 0.04))
+    if not np.any(stained):
         return None
 
-    tight = np.zeros(mask_bool.shape, dtype=np.uint8)
-    cv2.circle(tight, (int(round(cx)), int(round(cy))), max(8, int(round(radius))), 255, -1)
-    tight_mask = (tight > 0) & mask_bool
+    h, w = stain.shape
+    ys, xs = np.where(stained)
+    dists = np.sqrt((xs - cx) ** 2 + (ys - cy) ** 2)
+    stain_extent = float(np.percentile(dists, 95))
+    max_search = float(min(h, w) * 0.5)
+    max_search = max(max_search, stain_extent * 1.12)
 
-    return DropGeometry(center=(cx, cy), radius=radius, mask=tight_mask)
+    profile = _radial_mean_profile(stain, paper_mask, (cx, cy), max_search, bins=80)
+    core_peak = float(np.max(profile[: max(6, len(profile) // 8)]))
+    norm_wick = _wick_radius_from_profile(profile, max(core_peak, peak * 0.45))
+    radius = max(14.0, norm_wick * max_search)
+    radius = float(np.clip(radius, stain_extent * 0.88, stain_extent * 1.04))
+
+    mask = _rasterize_mask((cx, cy), radius, (h, w)) & paper_mask
+    return DropGeometry(center=(cx, cy), radius=radius, mask=mask)
+
+
+def _candidate_from_geometry(stain: np.ndarray, geometry: DropGeometry) -> DropCandidate:
+    mean_stain = float(np.mean(stain[geometry.mask])) if np.any(geometry.mask) else 0.0
+    score = mean_stain * 2.5 + geometry.radius * 0.6
+    return DropCandidate(index=0, mask=geometry.mask, geometry=geometry, score=score)
 
 
 def _dilate_paper_mask(paper_mask: np.ndarray, margin_px: int = 14) -> np.ndarray:
@@ -694,8 +792,8 @@ def _find_stain_peak_positions(
     if paper_max <= 0:
         return []
 
-    stain_floor = paper_max * (0.50 if paper_frac > 0.72 else 0.42) if min_stain is None else min_stain
-    stain_floor = max(stain_floor, 0.35)
+    stain_floor = paper_max * (0.28 if paper_frac > 0.72 else 0.36) if min_stain is None else min_stain
+    stain_floor = max(stain_floor, 0.12)
 
     x0, y0, x1, y1 = _paper_bounds(search_mask)
     paper_w = x1 - x0 + 1
@@ -840,45 +938,49 @@ def find_drop_candidates(
 
 
 def find_drop_candidates_full_image(rgb: np.ndarray) -> tuple[list[DropCandidate], float]:
-    """Пики ищутся на уменьшенной копии, маска строится на полном разрешении."""
+    """Поиск капель: legacy-полосы + хроматограмма по окраске на полном разрешении."""
     detect_rgb, scale = resize_for_detection(rgb)
+    inv_scale = 1.0 / scale
+
+    paper_full = detect_paper_mask(rgb)
+    stain_full = compute_stain_map(rgb, paper_full)
+
     paper_mask = detect_paper_mask(detect_rgb)
     stain = compute_stain_map(detect_rgb, paper_mask)
 
-    x0, y0, x1, y1 = _paper_bounds(paper_mask)
-    paper_short = min(x1 - x0 + 1, y1 - y0 + 1)
-    min_distance = max(28, int(paper_short * 0.11 / max(scale, 1e-6)))
-    peaks = _find_stain_peak_positions(stain, paper_mask, min_distance=min_distance)
-
-    inv_scale = 1.0 / scale
     raw: list[DropCandidate] = []
-    for cx, cy in peaks:
-        candidate = build_drop_at_point_full(cx * inv_scale, cy * inv_scale, rgb, from_click=False)
-        if candidate is not None:
-            raw.append(candidate)
+
+    def add_at(full_x: float, full_y: float) -> None:
+        geometry = find_chromatogram_geometry(
+            stain_full,
+            paper_full,
+            hint_center=(full_x, full_y),
+        )
+        if geometry is not None:
+            raw.append(_candidate_from_geometry(stain_full, geometry))
+            return
+        fallback = build_drop_at_point_click(full_x, full_y, stain_full, paper_full)
+        if fallback is not None:
+            raw.append(fallback)
+
+    for candidate in find_drop_candidates_legacy(stain, paper_mask):
+        cx, cy = candidate.geometry.center
+        add_at(cx * inv_scale, cy * inv_scale)
 
     if not raw:
-        candidates = find_drop_candidates(stain, detect_rgb, paper_mask)
-        for candidate in candidates:
-            full = build_drop_at_point_full(
-                candidate.geometry.center[0] * inv_scale,
-                candidate.geometry.center[1] * inv_scale,
-                rgb,
-                from_click=False,
-            )
-            if full is not None:
-                raw.append(full)
+        x0, y0, x1, y1 = _paper_bounds(paper_mask)
+        paper_short = min(x1 - x0 + 1, y1 - y0 + 1)
+        min_distance = max(24, int(paper_short * 0.09 / max(scale, 1e-6)))
+        peaks = _find_stain_peak_positions(stain, paper_mask, min_distance=min_distance)
+        for cx, cy in peaks:
+            add_at(cx * inv_scale, cy * inv_scale)
 
     if not raw:
-        for candidate in find_drop_candidates_legacy(stain, paper_mask):
-            full = build_drop_at_point_full(
-                candidate.geometry.center[0] * inv_scale,
-                candidate.geometry.center[1] * inv_scale,
-                rgb,
-                from_click=True,
-            )
-            if full is not None:
-                raw.append(full)
+        work = stain_full.copy()
+        work[~paper_full] = 0.0
+        if float(work.max()) >= 0.08:
+            cy, cx = np.unravel_index(int(np.argmax(work)), work.shape)
+            add_at(float(cx), float(cy))
 
     kept = _dedupe_candidates(raw)
     kept.sort(key=lambda c: c.score, reverse=True)
@@ -904,6 +1006,11 @@ def build_drop_at_point_full(
     """Капля вокруг точки на полном изображении."""
     paper_mask = detect_paper_mask(rgb)
     stain = compute_stain_map(rgb, paper_mask)
+    geometry = find_chromatogram_geometry(stain, paper_mask, hint_center=(cx, cy))
+    if geometry is not None:
+        candidate = _candidate_from_geometry(stain, geometry)
+        candidate.index = 0
+        return candidate
     if from_click:
         candidate = build_drop_at_point_click(cx, cy, stain, paper_mask)
     else:
@@ -920,22 +1027,25 @@ def build_drop_from_circle(
     radius: float,
     rgb: np.ndarray,
 ) -> DropCandidate:
-    """Ручная круглая область — центр и радиус задаёт пользователь."""
+    """Ручная круглая область — ROI для поиска хроматограммы по окраске."""
     h, w = rgb.shape[:2]
     radius = float(np.clip(radius, 8.0, min(h, w) * 0.45))
     cx = float(np.clip(cx, 0.0, w - 1.0))
     cy = float(np.clip(cy, 0.0, h - 1.0))
 
-    mask = _rasterize_mask((cx, cy), radius, (h, w))
+    user_mask = _rasterize_mask((cx, cy), radius, (h, w))
     paper_mask = detect_paper_mask(rgb)
     stain = compute_stain_map(rgb, paper_mask)
-    geometry = find_drop_geometry(stain, mask)
+    geometry = find_chromatogram_geometry(
+        stain,
+        paper_mask,
+        hint_center=(cx, cy),
+        search_mask=user_mask,
+    )
     if geometry is None:
-        geometry = DropGeometry(center=(cx, cy), radius=radius, mask=mask)
+        geometry = DropGeometry(center=(cx, cy), radius=radius, mask=user_mask)
 
-    mean_stain = float(np.mean(stain[geometry.mask])) if np.any(geometry.mask) else 0.0
-    score = mean_stain * 2.0 + geometry.radius
-    return DropCandidate(index=0, mask=geometry.mask, geometry=geometry, score=score)
+    return _candidate_from_geometry(stain, geometry)
 
 
 def crop_drop(

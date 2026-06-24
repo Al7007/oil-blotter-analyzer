@@ -15,8 +15,8 @@ from pipeline.preprocess import (
     compute_stain_map,
     crop_drop,
     detect_paper_mask,
+    find_chromatogram_geometry,
     find_drop_candidates_full_image,
-    find_drop_geometry,
 )
 from pipeline.radial import segment_blotter_zones, zones_to_legacy_dict
 from pipeline.types import Diagnostics, DropCandidateInfo, DropConsistency, PipelineResult
@@ -122,11 +122,24 @@ def run_pipeline(
     paper_mask = detect_paper_mask(original_rgb)
     stain_full = compute_stain_map(original_rgb, paper_mask)
 
+    chroma = find_chromatogram_geometry(
+        stain_full,
+        paper_mask,
+        hint_center=selected.geometry.center,
+        search_mask=selected.mask if manual_regions else None,
+    )
+    if chroma is not None:
+        selected.geometry = chroma
+        selected.mask = chroma.mask
+
     cropped_rgb, stain, mask = crop_drop(
         original_rgb, stain_full, selected.mask, padding_ratio=padding_ratio
     )
 
-    geometry = find_drop_geometry(stain, mask) or selected.geometry
+    crop_paper = np.ones(stain.shape, dtype=bool)
+    geometry = find_chromatogram_geometry(stain, crop_paper)
+    if geometry is None:
+        geometry = selected.geometry
 
     enhanced = enhance_stain(stain, geometry.mask, method=contrast_method, clip_limit=clahe_clip)
     inverted = invert_within_drop(enhanced, geometry.mask)
