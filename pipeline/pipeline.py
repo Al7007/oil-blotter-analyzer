@@ -104,16 +104,14 @@ def run_pipeline(
             selected = build_drop_at_point_full(click_point[0], click_point[1], original_rgb)
             if selected is None:
                 raise ValueError(
-                    "Не удалось выделить каплю в этой точке. "
-                    "Зажмите мышь на центре пятна и потяните, чтобы задать круг."
+                    "Не удалось выделить каплю в этой точке. Кликните ближе к центру пятна."
                 )
             candidates, idx = _merge_candidates(candidates, selected)
         elif candidates:
             idx = min(max(candidate_index, 0), len(candidates) - 1)
         else:
             raise ValueError(
-                "Не удалось найти каплю. Зажмите мышь на центре пятна и потяните, "
-                "чтобы выделить круглую область."
+                "Не удалось найти каплю. Кликните по капле на исходнике или выделите круг вручную."
             )
 
     for i, c in enumerate(candidates):

@@ -603,6 +603,50 @@ def build_drop_at_point(
     return candidate
 
 
+def build_drop_at_point_click(
+    cx: float,
+    cy: float,
+    stain: np.ndarray,
+    paper_mask: np.ndarray,
+) -> DropCandidate | None:
+    """Капля вокруг точки клика — алгоритм первой версии приложения."""
+    h, w = stain.shape
+    cx_i = int(np.clip(cx, 0, w - 1))
+    cy_i = int(np.clip(cy, 0, h - 1))
+    if not paper_mask[cy_i, cx_i]:
+        return None
+
+    peak = float(stain[cy_i, cx_i])
+    if peak < 0.2:
+        return None
+
+    max_r = min(h, w) // 2
+    best_r = 0
+    for radius in range(16, max_r, 6):
+        mask = np.zeros((h, w), dtype=np.uint8)
+        cv2.circle(mask, (cx_i, cy_i), radius, 255, thickness=cv2.FILLED)
+        region = (mask > 0) & paper_mask
+        if np.count_nonzero(region) == 0:
+            break
+        mean_stain = float(np.mean(stain[region]))
+        if mean_stain < peak * 0.22:
+            break
+        best_r = radius
+
+    if best_r < 16:
+        best_r = 24
+    mask = np.zeros((h, w), dtype=np.uint8)
+    cv2.circle(mask, (cx_i, cy_i), best_r, 255, thickness=cv2.FILLED)
+
+    geometry = find_drop_geometry(stain, mask)
+    if geometry is None:
+        return None
+
+    mean_stain = float(np.mean(stain[(mask > 0) & paper_mask]))
+    score = min(mean_stain, 30.0) * 2.0 + geometry.radius * 0.8
+    return DropCandidate(index=0, mask=(mask > 0), geometry=geometry, score=score)
+
+
 def _detection_mask(paper_mask: np.ndarray) -> np.ndarray:
     """Зона поиска капель. При «вся картинка = бумага» отрезаем только рамку кадра."""
     mask = paper_mask.copy()
@@ -777,7 +821,10 @@ def build_drop_at_point_full(
     """Капля вокруг точки на полном изображении."""
     paper_mask = detect_paper_mask(rgb)
     stain = compute_stain_map(rgb, paper_mask)
-    candidate = build_drop_at_point(cx, cy, stain, paper_mask, from_click=from_click)
+    if from_click:
+        candidate = build_drop_at_point_click(cx, cy, stain, paper_mask)
+    else:
+        candidate = build_drop_at_point(cx, cy, stain, paper_mask, from_click=False)
     if candidate is None:
         return None
     candidate.index = 0

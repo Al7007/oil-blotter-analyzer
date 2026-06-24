@@ -117,6 +117,7 @@ class OilDropAnalyzerApp:
         self._move_offset_image: tuple[float, float] | None = None
         self._drag_start_canvas: tuple[float, float] | None = None
         self._drag_center_image: tuple[float, float] | None = None
+        self._click_pending = False
         self._drag_preview_id: int | None = None
         self._canvas_image_id: int | None = None
         self._analysis_running = False
@@ -694,7 +695,14 @@ class OilDropAnalyzerApp:
         self._move_offset_image = None
         self._drag_start_canvas = None
         self._drag_center_image = None
+        self._click_pending = False
         self._clear_create_preview()
+
+    def _run_click_analysis(self, image_point: tuple[float, float]) -> None:
+        self._manual_regions = []
+        self._click_point = image_point
+        self._analysis_mode = "click"
+        self.run_analysis(mode="click", click_point=self._click_point)
 
     def _on_canvas_configure(self, _event: tk.Event) -> None:
         if self._drag_start_canvas is not None:
@@ -727,6 +735,7 @@ class OilDropAnalyzerApp:
             self._move_offset_image = (point[0] - center_x, point[1] - center_y)
             self._drag_start_canvas = (cx, cy)
             self._drag_center_image = None
+            self._click_pending = False
             self.selected_candidate.set(hit)
             self._analysis_mode = "manual"
             if self._original_canvas is not None:
@@ -737,17 +746,20 @@ class OilDropAnalyzerApp:
         if center is None:
             return
 
-        self._drag_mode = "create"
+        self._drag_mode = None
         self._drag_region_index = None
         self._move_offset_image = None
         self._drag_start_canvas = (cx, cy)
         self._drag_center_image = center
+        self._click_pending = True
 
     def _on_canvas_drag(self, event: tk.Event) -> None:
         if self._drag_start_canvas is None or self._original_canvas is None:
             return
 
         cx, cy = self._canvas_pointer(event)
+        sx, sy = self._drag_start_canvas
+        moved_canvas = ((cx - sx) ** 2 + (cy - sy) ** 2) ** 0.5
 
         if self._drag_mode == "move" and self._drag_region_index is not None:
             point = self._canvas_to_image(cx, cy, clamp=True)
@@ -762,6 +774,10 @@ class OilDropAnalyzerApp:
             )
             self._draw_region_overlays()
             return
+
+        if self._click_pending and moved_canvas >= 6.0 and self._drag_center_image is not None:
+            self._click_pending = False
+            self._drag_mode = "create"
 
         if self._drag_mode != "create" or self._drag_center_image is None:
             return
@@ -798,16 +814,16 @@ class OilDropAnalyzerApp:
                 self.run_analysis(mode="manual")
             return
 
+        if self._click_pending and self._drag_center_image is not None:
+            click_point = self._drag_center_image
+            self._clear_drag_state()
+            self._run_click_analysis(click_point)
+            return
+
         center = self._drag_center_image
         self._clear_drag_state()
 
-        if center is None:
-            return
-
-        if moved_canvas < 6.0:
-            self._manual_regions = []
-            self._click_point = center
-            self.run_analysis(mode="click", click_point=self._click_point)
+        if center is None or self._drag_mode != "create":
             return
 
         current = self._canvas_to_image(ex, ey, clamp=True)
