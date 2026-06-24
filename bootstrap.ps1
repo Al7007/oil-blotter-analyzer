@@ -181,10 +181,21 @@ function Ensure-Tkinter([string]$PythonExe) {
     Write-Ok "tkinter доступен."
 }
 
+function Test-PackagesInstalled([string]$PythonExe) {
+    & $PythonExe -c "import cv2, numpy; from PIL import Image" 2>$null
+    return $LASTEXITCODE -eq 0
+}
+
 function Ensure-Packages([string]$PythonExe) {
     $requirements = Join-Path $ProjectRoot "requirements.txt"
     if (-not (Test-Path $requirements)) {
         throw "Файл requirements.txt не найден: $requirements"
+    }
+
+    Write-Info "Проверяю необходимые пакеты Python..."
+    if (Test-PackagesInstalled $PythonExe) {
+        Write-Ok "Все пакеты уже установлены (opencv-python, numpy, Pillow)."
+        return
     }
 
     $packageDescriptions = [ordered]@{
@@ -193,7 +204,7 @@ function Ensure-Packages([string]$PythonExe) {
         "Pillow"        = "Pillow — загрузка снимков и отображение в окне программы"
     }
 
-    Write-Info "Проверяю и устанавливаю необходимые пакеты Python..."
+    Write-Info "Устанавливаю недостающие пакеты..."
     foreach ($name in $packageDescriptions.Keys) {
         Write-Download "$name — $($packageDescriptions[$name])"
     }

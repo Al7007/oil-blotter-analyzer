@@ -226,19 +226,33 @@ def _estimate_fuel_pct(zones: BlotterZones, t_thickness_norm: float) -> float:
     return float(np.clip(estimate, 0.0, 20.0))
 
 
-def _estimate_water_pct(zones: BlotterZones, edge_roughness: float) -> float:
+def _estimate_water_pct(
+    zones: BlotterZones,
+    edge_roughness: float,
+    *,
+    dispersion_index: float,
+    contamination_index: float,
+) -> float:
     """
     Полевая оценка % воды/антифриза по форме внешнего ореола.
 
     Опора: вода и гликоль дают рваный, зигзагообразный край зоны T
     и нарушают круглость пятна (полевые наблюдения blotter test).
+
+    При хорошем DS и низкой саже неровный край чаще артефакт фото/бумаги.
     """
     circularity = _circularity(zones.drop)
-    roughness_score = max(0.0, (edge_roughness - 0.08) / 0.25)
-    shape_score = max(0.0, (0.82 - circularity) / 0.22)
+    roughness_score = max(0.0, (edge_roughness - 0.12) / 0.32)
+    shape_score = max(0.0, (0.76 - circularity) / 0.30)
 
-    estimate = roughness_score * 4.5 + shape_score * 3.5
-    return float(np.clip(estimate, 0.0, 12.0))
+    estimate = roughness_score * 2.8 + shape_score * 2.2
+
+    if dispersion_index > 0.70 and contamination_index < 30:
+        estimate = min(estimate * 0.22, 1.5)
+    elif dispersion_index > 0.55 and contamination_index < 40:
+        estimate *= 0.55
+
+    return float(np.clip(estimate, 0.0, 8.0))
 
 
 def _confidence_label(
@@ -306,21 +320,26 @@ def analyze(
 
     yellow_score, yellow_continuous = _ring_score(zones)
     core_uniformity, sludge_ratio = _core_uniformity(zones, intensity)
+    contamination_index = _contamination_index(zones, intensity, sludge_ratio)
 
     t_thickness_norm = max(0.0, 1.0 - zones.diffusion_radius_norm)
     blue_aura_ratio = t_thickness_norm
 
-    blue_roughness = _edge_roughness(zones.T)
+    blue_roughness = _edge_roughness(zones.drop)
 
     fuel_estimate_pct = _estimate_fuel_pct(zones, t_thickness_norm)
-    water_estimate_pct = _estimate_water_pct(zones, blue_roughness)
+    water_estimate_pct = _estimate_water_pct(
+        zones,
+        blue_roughness,
+        dispersion_index=dispersion_index,
+        contamination_index=contamination_index,
+    )
     fuel_status = _fuel_status_from_pct(fuel_estimate_pct)
     water_status = _water_status_from_pct(water_estimate_pct)
 
     merit_of_dispersancy = _merit_of_dispersancy(
         dispersion_index, yellow_score, sludge_ratio, yellow_continuous
     )
-    contamination_index = _contamination_index(zones, intensity, sludge_ratio)
     oxidation_index = _oxidation_index(rgb, zones)
     symmetry_index = _symmetry_index(zones, blue_roughness)
 

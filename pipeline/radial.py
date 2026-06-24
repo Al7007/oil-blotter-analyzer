@@ -73,6 +73,34 @@ def _find_core_radius(profile: np.ndarray) -> float:
     return 0.22
 
 
+def _find_diffusion_radius(profile: np.ndarray, aureole_norm: float) -> float:
+    """
+    Граница зон D/T: по умолчанию узкая кромка (~11% радиуса, norm=0.89).
+    Расширяется только если внешнее кольцо сохраняет окраску (признак топлива).
+    """
+    baseline = 0.89
+    bins = len(profile)
+    outer_start = int(0.76 * bins)
+    outer_end = max(outer_start + 2, int(0.97 * bins))
+    body_start = max(int(aureole_norm * bins) + 1, int(0.45 * bins))
+    body_end = int(0.76 * bins)
+
+    if outer_end <= outer_start or body_end <= body_start:
+        return baseline
+
+    outer_mean = float(np.mean(profile[outer_start:outer_end]))
+    body_mean = float(np.mean(profile[body_start:body_end]))
+    if body_mean <= 1e-6:
+        return baseline
+
+    retain = outer_mean / body_mean
+    if retain < 0.38:
+        return baseline
+
+    widen = min((retain - 0.38) / 0.42, 1.0) * 0.18
+    return float(np.clip(baseline - widen, aureole_norm + 0.10, baseline))
+
+
 def _find_aureole_radius(profile: np.ndarray, core_norm: float) -> float:
     """
     Внешняя граница жёлтого кольца A.
@@ -111,7 +139,7 @@ def segment_blotter_zones(
     core_norm = _find_core_radius(profile)
     aureole_norm = max(_find_aureole_radius(profile, core_norm), core_norm + 0.06)
     aureole_norm = min(aureole_norm, 0.45)
-    diffusion_norm = 0.84
+    diffusion_norm = _find_diffusion_radius(profile, aureole_norm)
 
     stain_vals = stain[mask]
     dark_threshold = float(np.percentile(stain_vals, 68)) if stain_vals.size else 0.0
