@@ -110,8 +110,13 @@ class OilDropAnalyzerApp:
         self.selected_candidate = tk.IntVar(value=0)
         self._original_display_meta: dict | None = None
         self._click_point: tuple[float, float] | None = None
+        self._analysis_mode: str = "auto"
         self._manual_regions: list[tuple[float, float, float]] = []
+        self._drag_mode: str | None = None
+        self._drag_region_index: int | None = None
+        self._move_offset_image: tuple[float, float] | None = None
         self._drag_start_canvas: tuple[float, float] | None = None
+        self._drag_center_image: tuple[float, float] | None = None
         self._drag_preview_id: int | None = None
         self._canvas_image_id: int | None = None
         self._analysis_running = False
@@ -141,7 +146,7 @@ class OilDropAnalyzerApp:
             ("Вставить (Ctrl+V)", self.paste_from_clipboard),
             ("Открыть файл", self.open_file),
             ("Веб-камера", self.open_webcam),
-            ("Анализ", self.run_analysis),
+            ("Анализ (авто)", self.run_auto_analysis),
             ("Сохранить спектр", self.save_spectral),
             ("Сохранить оверлей", self.save_overlay),
             ("О программе", self.show_about),
@@ -166,7 +171,9 @@ class OilDropAnalyzerApp:
         self.drop_selector = ttk.Combobox(settings, state="readonly", width=14)
         self.drop_selector.pack(side=tk.LEFT)
         self.drop_selector.bind("<<ComboboxSelected>>", self._on_drop_selected)
-        ttk.Label(settings, text="(на исходнике: зажмите и потяните круг)").pack(side=tk.LEFT, padx=6)
+        ttk.Label(settings, text="(авто — «Анализ»; клик — капля в точке; круг — вручную)").pack(
+            side=tk.LEFT, padx=6
+        )
         ttk.Button(settings, text="Сбросить капли", command=self._reset_manual_regions).pack(side=tk.LEFT, padx=8)
 
         body = ttk.Panedwindow(self.root, orient=tk.HORIZONTAL)
@@ -218,7 +225,7 @@ class OilDropAnalyzerApp:
         self.panels = {}
         self._original_canvas: tk.Canvas | None = None
         for key, title, parent in (
-            ("original", "Исходник (зажмите и потяните круг вокруг капли)", top),
+            ("original", "Исходник (клик / круг / перетаскивание)", top),
             ("cropped", "Кроп капли", top),
             ("spectral", "Спектрограмма (LUT)", bottom),
             ("overlay", "Метрики на изображении", bottom),
@@ -346,16 +353,24 @@ class OilDropAnalyzerApp:
     def _rerun(self) -> None:
         if self.source_image is None or self._analysis_running:
             return
-        if self._manual_regions or self.result is not None:
-            self.run_analysis()
+        if self._analysis_mode == "manual" and not self._manual_regions:
+            return
+        if self._analysis_mode == "click" and self._click_point is None:
+            if self.result is not None:
+                self._analysis_mode = "auto"
+            else:
+                return
+        self.run_analysis()
 
     def _set_loaded_hint(self) -> None:
         self._diag_view = "brief"
         self._set_diag_text(
-            "Снимок загружен.\n\n"
-            "На исходнике зажмите мышь на центре капли и потяните, "
-            "чтобы выделить круг. Можно добавить несколько капель.\n\n"
-            "Кнопка «Анализ» — автоопределение (если круг не рисовали).\n"
+            "Снимок загружен — идёт автоопределение капель.\n\n"
+            "Три способа выбора области:\n"
+            "1. Авто — кнопка «Анализ (авто)» или при открытии снимка.\n"
+            "2. Клик — короткий щелчок по центру капли на исходнике.\n"
+            "3. Вручную — зажмите на центре и потяните до края; круг рисуется в реальном времени. "
+            "Крестик над кругом удаляет зону.\n"
         )
         self.diag_detail_btn.config(state=tk.DISABLED)
         self.diag_summary_btn.config(state=tk.DISABLED)
@@ -461,98 +476,357 @@ class OilDropAnalyzerApp:
         self.selected_candidate.set(0)
         self._click_point = None
         self._manual_regions = []
+        self._analysis_mode = "auto"
         self.result = None
         self._update_drop_selector()
         self._clear_result_panels()
         self._show_source_preview()
         self._set_loaded_hint()
+        self.run_analysis(mode="auto")
 
     def _reset_manual_regions(self) -> None:
         if self.source_image is None:
             return
         self._manual_regions = []
         self._click_point = None
+        self._analysis_mode = "auto"
         self.selected_candidate.set(0)
         self.result = None
         self._update_drop_selector()
         self._clear_result_panels()
         self._show_source_preview()
         self._set_loaded_hint()
-        self.status.config(text="Области сброшены — выделите каплю кругом на исходнике")
+        self.status.config(text="Ручные области сброшены — автоопределение…")
+        self.run_analysis(mode="auto")
 
-    def _canvas_to_image(self, canvas_x: float, canvas_y: float) -> tuple[float, float] | None:
+    def _canvas_pointer(self, event: tk.Event) -> tuple[float, float]:
+        canvas = self._original_canvas
+        if canvas is None:
+            return float(event.x), float(event.y)
+        return float(canvas.canvasx(event.x)), float(canvas.canvasy(event.y))
+
+    def _canvas_to_image(self, canvas_x: float, canvas_y: float, *, clamp: bool = False) -> tuple[float, float] | None:
         if self._original_display_meta is None:
             return None
         meta = self._original_display_meta
         local_x = canvas_x - meta["offset_x"]
         local_y = canvas_y - meta["offset_y"]
-        if local_x < 0 or local_y < 0 or local_x > meta["draw_w"] or local_y > meta["draw_h"]:
+        if clamp:
+            local_x = min(max(local_x, 0.0), meta["draw_w"])
+            local_y = min(max(local_y, 0.0), meta["draw_h"])
+        elif local_x < 0 or local_y < 0 or local_x > meta["draw_w"] or local_y > meta["draw_h"]:
             return None
         return local_x / meta["scale"], local_y / meta["scale"]
 
-    def _on_canvas_configure(self, _event: tk.Event) -> None:
+    def _image_radius_to_canvas(self, radius: float) -> float:
+        if self._original_display_meta is None:
+            return radius
+        return radius * self._original_display_meta["scale"]
+
+    def _hit_test_remove_button(self, canvas_x: float, canvas_y: float) -> int | None:
+        canvas = self._original_canvas
+        if canvas is None or not self._manual_regions:
+            return None
+        items = canvas.find_overlapping(canvas_x - 2, canvas_y - 2, canvas_x + 2, canvas_y + 2)
+        for item in items:
+            for tag in canvas.gettags(item):
+                if tag.startswith("region_remove_"):
+                    try:
+                        return int(tag.split("_")[-1])
+                    except ValueError:
+                        continue
+        return None
+
+    def _image_to_canvas(self, image_x: float, image_y: float) -> tuple[float, float] | None:
+        if self._original_display_meta is None:
+            return None
+        meta = self._original_display_meta
+        return (
+            meta["offset_x"] + image_x * meta["scale"],
+            meta["offset_y"] + image_y * meta["scale"],
+        )
+
+    def _hit_test_region(self, canvas_x: float, canvas_y: float) -> int | None:
+        point = self._canvas_to_image(canvas_x, canvas_y)
+        if point is None:
+            return None
+        px, py = point
+        for index in reversed(range(len(self._manual_regions))):
+            cx, cy, radius = self._manual_regions[index]
+            if (px - cx) ** 2 + (py - cy) ** 2 <= radius**2:
+                return index
+        return None
+
+    def _original_display_image(self) -> Image.Image | None:
         if self.source_image is None:
-            return
+            return None
+        if self._manual_regions:
+            return self.source_image
         if self.result is not None:
-            self._show_original_canvas(self.result.original)
-        else:
-            self._show_original_canvas(self.source_image)
+            return self.result.original
+        return self.source_image
+
+    def _remove_manual_region(self, index: int) -> None:
+        if index < 0 or index >= len(self._manual_regions):
+            return
+        del self._manual_regions[index]
+        if not self._manual_regions:
+            self._analysis_mode = "auto"
+            self.selected_candidate.set(0)
+            image = self._original_display_image()
+            if image is not None:
+                self._show_original_canvas(image)
+            if self.source_image is not None:
+                self.run_analysis(mode="auto")
+            return
+
+        next_index = min(index, len(self._manual_regions) - 1)
+        self.selected_candidate.set(next_index)
+        self._analysis_mode = "manual"
+        image = self._original_display_image()
+        if image is not None:
+            self._show_original_canvas(image)
+        self.run_analysis(mode="manual")
+
+    def _draw_region_overlays(self) -> None:
+        canvas = self._original_canvas
+        if canvas is None:
+            return
+        canvas.delete("region_overlay")
+        if not self._manual_regions:
+            return
+
+        selected = self.selected_candidate.get()
+        for index, (cx, cy, radius) in enumerate(self._manual_regions):
+            center = self._image_to_canvas(cx, cy)
+            if center is None:
+                continue
+            sx, sy = center
+            sr = self._image_radius_to_canvas(radius)
+            color = "#40dc40" if index == selected else "#ffc800"
+            canvas.create_oval(
+                sx - sr,
+                sy - sr,
+                sx + sr,
+                sy + sr,
+                outline=color,
+                width=2,
+                tags="region_overlay",
+            )
+            canvas.create_text(
+                sx,
+                sy - sr - 10,
+                text=str(index + 1),
+                fill=color,
+                tags="region_overlay",
+            )
+            btn_x = sx
+            btn_y = sy - sr - 22
+            btn_size = 9
+            remove_tag = f"region_remove_{index}"
+            canvas.create_rectangle(
+                btn_x - btn_size,
+                btn_y - btn_size,
+                btn_x + btn_size,
+                btn_y + btn_size,
+                fill="#b91c1c",
+                outline="#ffffff",
+                width=1,
+                tags=("region_overlay", remove_tag),
+            )
+            canvas.create_text(
+                btn_x,
+                btn_y,
+                text="×",
+                fill="#ffffff",
+                font=("Segoe UI", 10, "bold"),
+                tags=("region_overlay", remove_tag),
+            )
+
+            def on_remove(_event: tk.Event, region_index: int = index) -> str:
+                self._remove_manual_region(region_index)
+                return "break"
+
+            canvas.tag_bind(remove_tag, "<ButtonPress-1>", on_remove)
+            canvas.tag_bind(remove_tag, "<Enter>", lambda _e: canvas.config(cursor="hand2"))
+            canvas.tag_bind(remove_tag, "<Leave>", lambda _e: canvas.config(cursor="crosshair"))
+            canvas.tag_raise(remove_tag)
+
+    def _clear_create_preview(self) -> None:
+        canvas = self._original_canvas
+        if canvas is not None:
+            canvas.delete("drag_preview")
+        self._drag_preview_id = None
+
+    def _draw_create_preview(self, center_image: tuple[float, float], radius_image: float) -> None:
+        canvas = self._original_canvas
+        if canvas is None or radius_image <= 0:
+            return
+        center = self._image_to_canvas(center_image[0], center_image[1])
+        if center is None:
+            return
+        sx, sy = center
+        sr = self._image_radius_to_canvas(radius_image)
+        self._clear_create_preview()
+        self._drag_preview_id = canvas.create_oval(
+            sx - sr,
+            sy - sr,
+            sx + sr,
+            sy + sr,
+            outline="#40dc40",
+            width=2,
+            dash=(4, 3),
+            tags="drag_preview",
+        )
+        canvas.create_oval(
+            sx - 3,
+            sy - 3,
+            sx + 3,
+            sy + 3,
+            fill="#40dc40",
+            outline="",
+            tags="drag_preview",
+        )
+
+    def _clear_drag_state(self) -> None:
+        self._drag_mode = None
+        self._drag_region_index = None
+        self._move_offset_image = None
+        self._drag_start_canvas = None
+        self._drag_center_image = None
+        self._clear_create_preview()
+
+    def _on_canvas_configure(self, _event: tk.Event) -> None:
+        if self._drag_start_canvas is not None:
+            return
+        image = self._original_display_image()
+        if image is not None:
+            self._show_original_canvas(image)
 
     def _on_canvas_press(self, event: tk.Event) -> None:
         if self.source_image is None or self._analysis_running:
             return
-        self._drag_start_canvas = (event.x, event.y)
-        if self._original_canvas is not None and self._drag_preview_id is not None:
-            self._original_canvas.delete(self._drag_preview_id)
-            self._drag_preview_id = None
+
+        cx, cy = self._canvas_pointer(event)
+        remove_index = self._hit_test_remove_button(cx, cy)
+        if remove_index is not None:
+            return
+
+        self._clear_create_preview()
+
+        hit = None
+        if self._manual_regions:
+            hit = self._hit_test_region(cx, cy)
+        if hit is not None:
+            center_x, center_y, _radius = self._manual_regions[hit]
+            point = self._canvas_to_image(cx, cy, clamp=True)
+            if point is None:
+                return
+            self._drag_mode = "move"
+            self._drag_region_index = hit
+            self._move_offset_image = (point[0] - center_x, point[1] - center_y)
+            self._drag_start_canvas = (cx, cy)
+            self._drag_center_image = None
+            self.selected_candidate.set(hit)
+            self._analysis_mode = "manual"
+            if self._original_canvas is not None:
+                self._original_canvas.config(cursor="fleur")
+            return
+
+        center = self._canvas_to_image(cx, cy, clamp=True)
+        if center is None:
+            return
+
+        self._drag_mode = "create"
+        self._drag_region_index = None
+        self._move_offset_image = None
+        self._drag_start_canvas = (cx, cy)
+        self._drag_center_image = center
 
     def _on_canvas_drag(self, event: tk.Event) -> None:
         if self._drag_start_canvas is None or self._original_canvas is None:
             return
-        sx, sy = self._drag_start_canvas
-        if self._drag_preview_id is not None:
-            self._original_canvas.delete(self._drag_preview_id)
-        radius = max(3.0, ((event.x - sx) ** 2 + (event.y - sy) ** 2) ** 0.5)
-        self._drag_preview_id = self._original_canvas.create_oval(
-            sx - radius,
-            sy - radius,
-            sx + radius,
-            sy + radius,
-            outline="#40dc40",
-            width=2,
-            dash=(4, 3),
+
+        cx, cy = self._canvas_pointer(event)
+
+        if self._drag_mode == "move" and self._drag_region_index is not None:
+            point = self._canvas_to_image(cx, cy, clamp=True)
+            if point is None or self._move_offset_image is None:
+                return
+            ox, oy = self._move_offset_image
+            _center_x, _center_y, radius = self._manual_regions[self._drag_region_index]
+            self._manual_regions[self._drag_region_index] = (
+                point[0] - ox,
+                point[1] - oy,
+                radius,
+            )
+            self._draw_region_overlays()
+            return
+
+        if self._drag_mode != "create" or self._drag_center_image is None:
+            return
+
+        current = self._canvas_to_image(cx, cy, clamp=True)
+        if current is None:
+            return
+        center_x, center_y = self._drag_center_image
+        radius = float(
+            ((current[0] - center_x) ** 2 + (current[1] - center_y) ** 2) ** 0.5
         )
+        self._draw_create_preview(self._drag_center_image, radius)
 
     def _on_canvas_release(self, event: tk.Event) -> None:
         if self._drag_start_canvas is None or self.source_image is None:
             return
 
         sx, sy = self._drag_start_canvas
-        self._drag_start_canvas = None
-        if self._original_canvas is not None and self._drag_preview_id is not None:
-            self._original_canvas.delete(self._drag_preview_id)
-            self._drag_preview_id = None
+        ex, ey = self._canvas_pointer(event)
+        moved_canvas = ((ex - sx) ** 2 + (ey - sy) ** 2) ** 0.5
 
-        start = self._canvas_to_image(sx, sy)
-        end = self._canvas_to_image(event.x, event.y)
-        if start is None:
+        if self._drag_mode == "move" and self._drag_region_index is not None:
+            index = self._drag_region_index
+            self._clear_drag_state()
+            if self._original_canvas is not None:
+                self._original_canvas.config(cursor="crosshair")
+            self.selected_candidate.set(index)
+            self._click_point = None
+            self._analysis_mode = "manual"
+            if moved_canvas >= 3.0:
+                self.run_analysis(mode="manual")
+            else:
+                self._draw_region_overlays()
+                self.run_analysis(mode="manual")
             return
 
-        if end is None:
-            end = start
+        center = self._drag_center_image
+        self._clear_drag_state()
 
-        ix0, iy0 = start
-        ix1, iy1 = end
-        radius = float(((ix1 - ix0) ** 2 + (iy1 - iy0) ** 2) ** 0.5)
-        if radius < 12.0:
-            self._click_point = (ix0, iy0)
-            self.run_analysis(click_point=self._click_point)
+        if center is None:
             return
 
-        self._manual_regions.append((ix0, iy0, radius))
+        if moved_canvas < 6.0:
+            self._manual_regions = []
+            self._click_point = center
+            self.run_analysis(mode="click", click_point=self._click_point)
+            return
+
+        current = self._canvas_to_image(ex, ey, clamp=True)
+        if current is None:
+            current = center
+
+        radius = float(
+            ((current[0] - center[0]) ** 2 + (current[1] - center[1]) ** 2) ** 0.5
+        )
+        radius = max(10.0, radius)
+
+        self._manual_regions.append((center[0], center[1], radius))
         self.selected_candidate.set(len(self._manual_regions) - 1)
         self._click_point = None
-        self.run_analysis()
+        self._analysis_mode = "manual"
+        image = self._original_display_image()
+        if image is not None:
+            self._show_original_canvas(image)
+        self.run_analysis(mode="manual")
 
     def _prepare_image(self, image: Image.Image) -> Image.Image:
         image = image.convert("RGB")
@@ -584,16 +858,46 @@ class OilDropAnalyzerApp:
         if selected < len(values):
             self.drop_selector.set(values[selected])
 
-    def run_analysis(self, click_point: tuple[float, float] | None = None) -> None:
+    def run_auto_analysis(self) -> None:
+        if self.source_image is None:
+            return
+        self._manual_regions = []
+        self._analysis_mode = "auto"
+        self._click_point = None
+        self.run_analysis(mode="auto")
+
+    def run_analysis(
+        self,
+        *,
+        mode: str | None = None,
+        click_point: tuple[float, float] | None = None,
+    ) -> None:
         if self.source_image is None or self._analysis_running:
             return
 
-        self._analysis_running = True
-        self.status.config(text="Анализ…")
-        self.root.update_idletasks()
-
+        if mode is not None:
+            self._analysis_mode = mode
         if click_point is not None:
             self._click_point = click_point
+            self._analysis_mode = "click"
+
+        pipeline_click: tuple[float, float] | None = None
+        manual_regions: list[tuple[float, float, float]] | None = None
+
+        if self._analysis_mode == "manual":
+            if not self._manual_regions:
+                return
+            manual_regions = list(self._manual_regions)
+        elif self._analysis_mode == "click":
+            if self._click_point is None:
+                return
+            pipeline_click = self._click_point
+        # auto: оба параметра None — полное автоопределение
+
+        self._analysis_running = True
+        mode_labels = {"auto": "автоопределение", "click": "определение по клику", "manual": "ручные области"}
+        self.status.config(text=f"Анализ ({mode_labels.get(self._analysis_mode, self._analysis_mode)})…")
+        self.root.update_idletasks()
 
         args = (
             self.source_image,
@@ -601,8 +905,8 @@ class OilDropAnalyzerApp:
             self.clahe_clip.get(),
             self.padding.get(),
             self.selected_candidate.get(),
-            self._click_point,
-            list(self._manual_regions) if self._manual_regions else None,
+            pipeline_click,
+            manual_regions,
         )
 
         thread = threading.Thread(target=self._analysis_worker, args=args, daemon=True)
@@ -635,17 +939,24 @@ class OilDropAnalyzerApp:
     def _apply_result(self, result: PipelineResult | None, error: Exception | None) -> None:
         self._analysis_running = False
         if error is not None:
-            if self.source_image is not None:
-                self._show_original_canvas(self.source_image)
-            if self._manual_regions:
+            image = self._original_display_image()
+            if image is not None:
+                self._show_original_canvas(image)
+            if self._analysis_mode == "manual":
                 messagebox.showerror("Ошибка конвейера", str(error))
+                self.status.config(text="Ошибка анализа ручной области")
+            elif self._analysis_mode == "click":
+                messagebox.showinfo(
+                    "Клик не удался",
+                    f"{error}\n\nПопробуйте «Анализ (авто)» или выделите каплю кругом вручную.",
+                )
+                self.status.config(text="Клик не удался — попробуйте авто или ручной круг")
             else:
                 messagebox.showinfo(
                     "Автоопределение не удалось",
-                    f"{error}\n\nВыделите каплю вручную: зажмите мышь на центре пятна "
-                    "и потяните до края, чтобы задать круг.",
+                    f"{error}\n\nЩёлкните по центру капли или выделите круг вручную.",
                 )
-            self.status.config(text="Выделите каплю кругом на исходнике")
+                self.status.config(text="Авто не удалось — клик или ручной круг")
             return
 
         assert result is not None
@@ -670,11 +981,15 @@ class OilDropAnalyzerApp:
         }
         for key, image in mapping.items():
             self._show_image(key, image)
-        self._show_original_canvas(self.result.original)
+        display = self._original_display_image()
+        if display is not None:
+            self._show_original_canvas(display)
 
     def _show_original_canvas(self, image: Image.Image) -> None:
         canvas = self._original_canvas
         if canvas is None:
+            return
+        if self._drag_start_canvas is not None:
             return
 
         canvas.update_idletasks()
@@ -692,6 +1007,8 @@ class OilDropAnalyzerApp:
             "offset_y": offset_y,
             "draw_w": preview.width,
             "draw_h": preview.height,
+            "image_w": image.width,
+            "image_h": image.height,
         }
 
         canvas.delete("all")
@@ -701,6 +1018,7 @@ class OilDropAnalyzerApp:
         self._photos["original"] = photo
         self._canvas_image_id = canvas.create_image(offset_x, offset_y, anchor=tk.NW, image=photo)
         canvas.config(bg="#2a2a2a", cursor="crosshair")
+        self._draw_region_overlays()
 
     def _show_image(self, key: str, image: Image.Image) -> None:
         label = self.panels[key]
