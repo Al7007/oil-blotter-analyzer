@@ -121,6 +121,7 @@ class OilDropAnalyzerApp:
         self._drag_preview_id: int | None = None
         self._canvas_image_id: int | None = None
         self._analysis_running = False
+        self._pending_analysis: dict | None = None
         self._diag_view = "brief"
         self._diag_click_reasons: dict[str, str] = {}
 
@@ -712,7 +713,7 @@ class OilDropAnalyzerApp:
             self._show_original_canvas(image)
 
     def _on_canvas_press(self, event: tk.Event) -> None:
-        if self.source_image is None or self._analysis_running:
+        if self.source_image is None:
             return
 
         cx, cy = self._canvas_pointer(event)
@@ -820,10 +821,11 @@ class OilDropAnalyzerApp:
             self._run_click_analysis(click_point)
             return
 
+        finished_mode = self._drag_mode
         center = self._drag_center_image
         self._clear_drag_state()
 
-        if center is None or self._drag_mode != "create":
+        if center is None or finished_mode != "create":
             return
 
         current = self._canvas_to_image(ex, ey, clamp=True)
@@ -839,9 +841,7 @@ class OilDropAnalyzerApp:
         self.selected_candidate.set(len(self._manual_regions) - 1)
         self._click_point = None
         self._analysis_mode = "manual"
-        image = self._original_display_image()
-        if image is not None:
-            self._show_original_canvas(image)
+        self._draw_region_overlays()
         self.run_analysis(mode="manual")
 
     def _prepare_image(self, image: Image.Image) -> Image.Image:
@@ -888,7 +888,7 @@ class OilDropAnalyzerApp:
         mode: str | None = None,
         click_point: tuple[float, float] | None = None,
     ) -> None:
-        if self.source_image is None or self._analysis_running:
+        if self.source_image is None:
             return
 
         if mode is not None:
@@ -897,16 +897,24 @@ class OilDropAnalyzerApp:
             self._click_point = click_point
             self._analysis_mode = "click"
 
+        if self._analysis_mode == "manual" and not self._manual_regions:
+            return
+        if self._analysis_mode == "click" and self._click_point is None:
+            return
+
+        if self._analysis_running:
+            self._pending_analysis = {
+                "mode": self._analysis_mode,
+                "click_point": self._click_point if self._analysis_mode == "click" else None,
+            }
+            return
+
         pipeline_click: tuple[float, float] | None = None
         manual_regions: list[tuple[float, float, float]] | None = None
 
         if self._analysis_mode == "manual":
-            if not self._manual_regions:
-                return
             manual_regions = list(self._manual_regions)
         elif self._analysis_mode == "click":
-            if self._click_point is None:
-                return
             pipeline_click = self._click_point
         # auto: оба параметра None — полное автоопределение
 
@@ -954,6 +962,9 @@ class OilDropAnalyzerApp:
 
     def _apply_result(self, result: PipelineResult | None, error: Exception | None) -> None:
         self._analysis_running = False
+        pending = self._pending_analysis
+        self._pending_analysis = None
+
         if error is not None:
             image = self._original_display_image()
             if image is not None:
@@ -973,6 +984,8 @@ class OilDropAnalyzerApp:
                     f"{error}\n\nЩёлкните по центру капли или выделите круг вручную.",
                 )
                 self.status.config(text="Авто не удалось — клик или ручной круг")
+            if pending:
+                self.run_analysis(mode=pending["mode"], click_point=pending["click_point"])
             return
 
         assert result is not None
@@ -985,6 +998,8 @@ class OilDropAnalyzerApp:
         self.status.config(
             text=f"Анализ завершён — капля {self.result.selected_candidate + 1} из {len(self.result.candidates)}"
         )
+        if pending:
+            self.run_analysis(mode=pending["mode"], click_point=pending["click_point"])
 
     def _show_result(self) -> None:
         if self.result is None:

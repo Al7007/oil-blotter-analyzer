@@ -611,14 +611,26 @@ def build_drop_at_point_click(
 ) -> DropCandidate | None:
     """Капля вокруг точки клика — алгоритм первой версии приложения."""
     h, w = stain.shape
-    cx_i = int(np.clip(cx, 0, w - 1))
-    cy_i = int(np.clip(cy, 0, h - 1))
-    if not paper_mask[cy_i, cx_i]:
-        return None
+    cx_i = int(np.clip(round(cx), 0, w - 1))
+    cy_i = int(np.clip(round(cy), 0, h - 1))
 
     peak = float(stain[cy_i, cx_i])
-    if peak < 0.2:
-        return None
+    if peak < 0.2 or not paper_mask[cy_i, cx_i]:
+        search_r = 48
+        x0 = max(0, cx_i - search_r)
+        x1 = min(w, cx_i + search_r + 1)
+        y0 = max(0, cy_i - search_r)
+        y1 = min(h, cy_i + search_r + 1)
+        window = stain[y0:y1, x0:x1].copy()
+        window[~paper_mask[y0:y1, x0:x1]] = 0.0
+        if float(window.max()) < 0.12:
+            return None
+        local_y, local_x = np.unravel_index(int(np.argmax(window)), window.shape)
+        cx_i = x0 + int(local_x)
+        cy_i = y0 + int(local_y)
+        peak = float(stain[cy_i, cx_i])
+        if peak < 0.12 or not paper_mask[cy_i, cx_i]:
+            return None
 
     max_r = min(h, w) // 2
     best_r = 0
@@ -732,6 +744,66 @@ def _dedupe_candidates(candidates: list[DropCandidate]) -> list[DropCandidate]:
     return kept
 
 
+def find_drop_candidates_legacy(
+    stain: np.ndarray,
+    paper_mask: np.ndarray,
+    *,
+    max_candidates: int = 4,
+) -> list[DropCandidate]:
+    """Резервный поиск капель — полосы бумаги, как в первой версии."""
+    ys, xs = np.where(paper_mask)
+    if ys.size == 0:
+        return []
+
+    y0, y1 = int(ys.min()), int(ys.max())
+    x0, x1 = int(xs.min()), int(xs.max())
+    paper_h = y1 - y0 + 1
+
+    if paper_h > 500:
+        bands = (
+            (y0, y0 + paper_h // 3),
+            (y0 + paper_h // 3, y0 + 2 * paper_h // 3),
+            (y0 + 2 * paper_h // 3, y1 + 1),
+        )
+    else:
+        mid = (y0 + y1) // 2
+        bands = ((y0, mid), (mid, y1 + 1))
+
+    raw: list[DropCandidate] = []
+    image_area = stain.shape[0] * stain.shape[1]
+    for ya, yb in bands:
+        region = np.zeros_like(paper_mask, dtype=bool)
+        region[ya:yb, x0 : x1 + 1] = paper_mask[ya:yb, x0 : x1 + 1]
+        region_stain = stain.copy()
+        region_stain[~region] = 0.0
+        if float(region_stain.max()) < 0.25:
+            continue
+
+        cy, cx = np.unravel_index(int(np.argmax(region_stain)), region_stain.shape)
+        candidate = build_drop_at_point_click(float(cx), float(cy), stain, paper_mask)
+        if candidate is None:
+            continue
+        if np.count_nonzero(candidate.mask) < image_area * 0.008:
+            continue
+        raw.append(candidate)
+
+    if not raw:
+        work = stain.copy()
+        work[~paper_mask] = 0.0
+        if float(work.max()) >= 0.12:
+            cy, cx = np.unravel_index(int(np.argmax(work)), work.shape)
+            fallback = build_drop_at_point_click(float(cx), float(cy), stain, paper_mask)
+            if fallback is not None:
+                raw.append(fallback)
+
+    kept = _dedupe_candidates(raw)
+    kept.sort(key=lambda c: (c.geometry.radius, c.score), reverse=True)
+    kept = kept[:max_candidates]
+    for i, candidate in enumerate(kept):
+        candidate.index = i
+    return kept
+
+
 def find_drop_candidates(
     stain: np.ndarray,
     rgb: np.ndarray,
@@ -793,6 +865,17 @@ def find_drop_candidates_full_image(rgb: np.ndarray) -> tuple[list[DropCandidate
                 candidate.geometry.center[1] * inv_scale,
                 rgb,
                 from_click=False,
+            )
+            if full is not None:
+                raw.append(full)
+
+    if not raw:
+        for candidate in find_drop_candidates_legacy(stain, paper_mask):
+            full = build_drop_at_point_full(
+                candidate.geometry.center[0] * inv_scale,
+                candidate.geometry.center[1] * inv_scale,
+                rgb,
+                from_click=True,
             )
             if full is not None:
                 raw.append(full)
